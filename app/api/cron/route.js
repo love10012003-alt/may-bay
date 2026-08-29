@@ -8,10 +8,18 @@ async function fetchReal(iata,key){
     const url=`https://api.aviationstack.com/v1/flights?access_key=${key}&arr_iata=${iata}&limit=25`
     const res=await fetch(url,{cache:'no-store'})
     const json=await res.json()
-    if(!json.data) return {flights:[]}
-    const flights=json.data.map(f=>({number:f.flight?.iata||f.flight?.number,origin:f.departure?.iata||'???',scheduled:f.arrival?.scheduled,estimated:f.arrival?.estimated||f.arrival?.scheduled,status:f.arrival?.delay>5?'delayed':f.flight_status,delayMin:f.arrival?.delay||0,gate:f.arrival?.gate||'B1',belt:f.arrival?.baggage||'1',airline:(f.airline?.name||'').split(' ')[0]}))
+    if(json.error) return {flights:[],error:json.error,rawCount:0}
+    if(!json.data) return {flights:[],rawCount:0}
+    const flights=json.data.map(f=>{
+      const sched=f.arrival?.scheduled
+      const est=f.arrival?.estimated||f.arrival?.scheduled
+      const delay=f.arrival?.delay||0
+      let status=f.flight_status||'scheduled'
+      if(delay>5) status='delayed'
+      return {number:f.flight?.iata||f.flight?.number||'UNKNOWN',origin:f.departure?.iata||'???',scheduled:sched,estimated:est,status,delayMin:delay,gate:f.arrival?.gate||'B1',belt:f.arrival?.baggage||'1',airline:(f.airline?.name||'').split(' ')[0]||'Airline',parking:'Bãi A - Còn 3',history:`${delay>0?'Delay':''} ${delay||0}p`}
+    }).filter(f=>f.scheduled)
     return {flights,rawCount:json.data.length}
-  }catch(e){return {flights:[]}}
+  }catch(e){return {flights:[],error:e.message,rawCount:0}}
 }
 function cluster60(flights){
   const sorted=[...flights].sort((a,b)=> new Date(a.estimated)-new Date(b.estimated))
@@ -22,17 +30,28 @@ function cluster60(flights){
 }
 export async function GET(){
   const url=process.env.SUPABASE_URL||process.env.NEXT_PUBLIC_SUPABASE_URL
-  const skey=process.env.SUPABASE_SECRET_KEY||process.env.SUPABASE_PUBLISHABLE_KEY
-  const aviationKey=process.env.AVIATIONSTACK_KEY
+  const skey=process.env.SUPABASE_SECRET_KEY||process.env.SUPABASE_PUBLISHABLE_KEY||process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  const aviationKey=process.env.AVIATIONSTACK_KEY||process.env.AVIATION_KEY
+  if(!url||!skey) return NextResponse.json({error:'Missing supabase keys'}, {status:500})
   const supabase=createClient(url,skey)
   const results=[]
   for(const iata of AIRPORTS){
-    const {flights,rawCount}=await fetchReal(iata,aviationKey)
-    let final=flights.length?flights:[{number:'VJ786',origin:'HAN',scheduled:new Date().toISOString(),estimated:new Date(Date.now()+25*60000).toISOString(),status:'delayed',delayMin:12,belt:'1',gate:'B1'}]
-    const clusters=cluster60(final)
-    const payload={iata,flights:final,clusters,updated_at:new Date().toISOString(),is_mock:flights.length===0,rawCount:rawCount||0}
-    await supabase.from('flight_cache').upsert({iata,data:payload,updated_at:payload.updated_at},{onConflict:'iata'})
-    results.push({iata,count:final.length,is_mock:flights.length===0,raw:rawCount||0})
+    const {flights,rawCount,error}=await fetchReal(iata,aviationKey)
+    let finalFlights=flights
+    let is_mock=false
+    if(finalFlights.length===0){
+      const now=new Date();const add=(m)=>new Date(now.getTime()+m*60000).toISOString()
+      finalFlights=[
+        {number:'VJ786',origin:'HAN',scheduled:add(20),estimated:add(25),status:'delayed',delayMin:12,belt:'1',gate:'B1',parking:'Bãi A - Còn 3',airline:'VietJet',history:'Delay 4/7 ngày'},
+        {number:'VN1321',origin:'VCA',scheduled:add(35),estimated:add(35),status:'on_time',belt:'2',gate:'B2',parking:'Bãi B - Còn 5',airline:'Vietnam',history:'Đúng giờ 6/7'},
+        {number:'QH1528',origin:'DAD',scheduled:add(70),estimated:add(75),status:'delayed',delayMin:15,belt:'1',gate:'A1',parking:'Bãi A',airline:'Bamboo',history:'Delay 2/7'},
+      ]
+      is_mock=true
+    }
+    const clusters=cluster60(finalFlights)
+    const payload={iata,flights:finalFlights,clusters,updated_at:new Date().toISOString(),is_mock,rawCount:rawCount||0}
+    const {error:upErr}=await supabase.from('flight_cache').upsert({iata,data:payload,updated_at:payload.updated_at},{onConflict:'iata'})
+    results.push({iata,count:finalFlights.length,is_mock,raw:rawCount||0,fetchError:error||null,upsertError:upErr?.message||null,upsertOk:!upErr})
   }
-  return NextResponse.json({ok:true,results})
+  return NextResponse.json({ok:true,results,time:new Date().toISOString()})
 }
